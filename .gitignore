@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+Results/
+Output/
+Initial Input Files/
+*.log
+README_RECOVERY.md
+SYNTAX_CHECK.md
