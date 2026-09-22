@@ -1,96 +1,314 @@
 from pathlib import Path
-import json
 
-import geopandas as gpd
 import pandas as pd
+import geopandas as gpd
 from shapely import wkt
-from shapely.geometry import shape
 
 
-PROJECT_ROOT = Path(r"D:\Sabin\Streetlight-Data-Processing")
-RESULTS_DIR = PROJECT_ROOT / "MOE for selected links" / "Results"
+# Paths
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+NETWORK_FILE = (
+    PROJECT_ROOT
+    / "Initial Input Files"
+    / "OSM_Short_Level_CSV"
+    / "Complete_OSM_Short_Level_Link_List.csv"
+)
+
+TXDOT_FILE = (
+    PROJECT_ROOT
+    / "Initial Input Files"
+    / "TxDOT"
+    / "link_list_with_speed_NOL.csv"
+)
+
+RESULTS_DIR = Path(__file__).resolve().parent / "Results"
+
 CORRIDOR_FILE = RESULTS_DIR / "corridor_links.csv"
-NETWORK_FILE = PROJECT_ROOT / "Initial Input Files" / "OSM_Short_Level_CSV" / "Complete_OSM_Short_Level_Link_List.csv"
-TXDOT_FILE = PROJECT_ROOT / "Initial Input Files" / "TxDOT" / "link_list_with_speed_NOL.csv"
+
 OUTPUT_GPKG = RESULTS_DIR / "corridor_qgis.gpkg"
 
-
-def normalize_gid(value):
-    if pd.isna(value):
-        return None
-    text = str(value).strip()
-    if text.endswith(".0"):
-        text = text[:-2]
-    return None if text in {"", "nan", "None", "-1"} else text
+NETWORK_CHUNK_SIZE = 500_000
+TXDOT_CHUNK_SIZE = 500_000
 
 
-def parse_geometry(value):
-    if value is None or pd.isna(value):
-        return None
-    text = str(value).strip()
-    try:
-        return shape(json.loads(text)) if text.startswith("{") else wkt.loads(text)
-    except Exception:
-        return None
+# Read the 40 selected corridor links
+def load_corridor():
+
+    corridor = pd.read_csv(
+        CORRIDOR_FILE,
+        dtype={
+            "link_key": "string",
+        },
+    )
+
+    return corridor
 
 
-def collect_network_links(link_keys):
-    usecols = [
-        "link_key", "geometry", "name", "from_node_id", "to_node_id", "heading", "length",
-        "Matched_GID", "RDBD_TYPE", "Functional Class", "facility_type",
+# Extract only the selected 40 links from the huge short-link network
+def extract_corridor_network(corridor):
+
+    target_links = set(
+        corridor["link_key"]
+    )
+
+    desired = [
+        "link_key",
+        "name",
+        "osm_way_id",
+        "from_node_id",
+        "to_node_id",
+        "geometry",
+        "facility_type",
+        "link_type",
+        "heading",
+        "length",
+        "Matched_GID",
+        "RDBD_TYPE",
+        "Functional Class",
     ]
-    parts = []
-    for chunk in pd.read_csv(NETWORK_FILE, usecols=usecols, chunksize=500_000, dtype="string", low_memory=False):
-        keep = chunk[chunk["link_key"].isin(link_keys)].copy()
-        if not keep.empty:
-            parts.append(keep)
-    return pd.concat(parts, ignore_index=True).drop_duplicates("link_key") if parts else pd.DataFrame()
 
+    header = pd.read_csv(
+        NETWORK_FILE,
+        nrows=0,
+    )
 
-def collect_txdot_segments(gids):
     usecols = [
-        "LinkID", "GID", "Geometry", "RDBD_TYPE", "DES_DRCT", "MAP_LBL", "Heading",
-        "SpeedLimit", "Ramp_type", "length", "Functional Class",
+        column
+        for column in desired
+        if column in header.columns
     ]
+
     parts = []
-    for chunk in pd.read_csv(TXDOT_FILE, usecols=usecols, chunksize=500_000, dtype="string", low_memory=False):
-        chunk["GID_norm"] = chunk["GID"].map(normalize_gid)
-        keep = chunk[chunk["GID_norm"].isin(gids)].copy()
-        if not keep.empty:
-            parts.append(keep)
-    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    total_rows = 0
+
+    for chunk_number, chunk in enumerate(
+        pd.read_csv(
+            NETWORK_FILE,
+            usecols=usecols,
+            chunksize=NETWORK_CHUNK_SIZE,
+            dtype="string",
+        ),
+        start=1,
+    ):
+
+        total_rows += len(chunk)
+
+        selected = chunk[
+            chunk["link_key"].isin(
+                target_links
+            )
+        ].copy()
+
+        if not selected.empty:
+            parts.append(selected)
+
+        found = (
+            pd.concat(parts)["link_key"].nunique()
+            if parts
+            else 0
+        )
+
+        print(
+            f"Network chunk {chunk_number:>3} | "
+            f"Rows: {total_rows:,} | "
+            f"Found: {found}/"
+            f"{len(target_links)}"
+        )
+
+        if found == len(target_links):
+            break
+
+    network = pd.concat(
+        parts,
+        ignore_index=True,
+    )
+
+    network = network.drop_duplicates(
+        subset="link_key"
+    )
+
+    network = network.merge(
+        corridor[
+            [
+                "corridor_order",
+                "link_key",
+                "distance_start_ft",
+                "distance_end_ft",
+                "posted_speed_limit_mph",
+            ]
+        ],
+        on="link_key",
+        how="left",
+    )
+
+    network["geometry"] = (
+        network["geometry"]
+        .apply(wkt.loads)
+    )
+
+    return gpd.GeoDataFrame(
+        network,
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+
+
+# Extract TxDOT segments belonging to corridor GIDs
+def extract_txdot_segments(corridor):
+
+    gid_column = None
+
+    for candidate in [
+        "txdot_gid",
+        "Matched_GID",
+    ]:
+
+        if candidate in corridor.columns:
+            gid_column = candidate
+            break
+
+    if gid_column is None:
+        return None
+
+    target_gids = set(
+        pd.to_numeric(
+            corridor[gid_column],
+            errors="coerce",
+        )
+        .dropna()
+        .astype(int)
+    )
+
+    if not target_gids:
+        return None
+
+    desired = [
+        "LinkID",
+        "GID",
+        "Geometry",
+        "RDBD_TYPE",
+        "DES_DRCT",
+        "MAP_LBL",
+        "SpeedLimit",
+        "NumberOfLanes",
+        "Ramp_type",
+        "Functional Class",
+    ]
+
+    header = pd.read_csv(
+        TXDOT_FILE,
+        nrows=0,
+    )
+
+    usecols = [
+        column
+        for column in desired
+        if column in header.columns
+    ]
+
+    parts = []
+    total_rows = 0
+
+    for chunk_number, chunk in enumerate(
+        pd.read_csv(
+            TXDOT_FILE,
+            usecols=usecols,
+            chunksize=TXDOT_CHUNK_SIZE,
+            dtype="string",
+        ),
+        start=1,
+    ):
+
+        total_rows += len(chunk)
+
+        gids = pd.to_numeric(
+            chunk["GID"],
+            errors="coerce",
+        )
+
+        selected = chunk[
+            gids.isin(
+                target_gids
+            )
+        ].copy()
+
+        if not selected.empty:
+            parts.append(selected)
+
+        print(
+            f"TxDOT chunk {chunk_number:>3} | "
+            f"Rows: {total_rows:,}"
+        )
+
+    if not parts:
+        return None
+
+    txdot = pd.concat(
+        parts,
+        ignore_index=True,
+    )
+
+    txdot["geometry"] = (
+        txdot["Geometry"]
+        .apply(wkt.loads)
+    )
+
+    return gpd.GeoDataFrame(
+        txdot,
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
 
 
 def main():
-    corridor = pd.read_csv(CORRIDOR_FILE, dtype="string")
-    link_keys = set(corridor["link_key"].dropna().astype(str))
-    network = collect_network_links(link_keys)
-    if network.empty:
-        raise RuntimeError("No corridor links found in the short-link network.")
 
-    network["geometry_obj"] = network["geometry"].map(parse_geometry)
-    network = network[network["geometry_obj"].notna()].copy()
-    attributes = corridor.drop(columns=["geometry"], errors="ignore")
-    network = network.merge(attributes, on="link_key", how="left", suffixes=("", "_corridor"))
+    # Step 1: Load the visualized corridor
+    corridor = load_corridor()
 
-    corridor_gdf = gpd.GeoDataFrame(network, geometry="geometry_obj", crs="EPSG:4326").sort_values("corridor_order")
-    gids = {normalize_gid(x) for x in corridor["Matched_GID"] if normalize_gid(x) is not None}
-    txdot = collect_txdot_segments(gids)
+    print(
+        f"Corridor links: {len(corridor)}"
+    )
 
-    if OUTPUT_GPKG.exists():
-        OUTPUT_GPKG.unlink()
+    # Step 2: Extract only those links
+    network = extract_corridor_network(
+        corridor
+    )
 
-    corridor_gdf.to_file(OUTPUT_GPKG, layer="corridor_links", driver="GPKG")
+    # Step 3: Save tiny corridor layer
+    network.to_file(
+        OUTPUT_GPKG,
+        layer="corridor_links",
+        driver="GPKG",
+    )
 
-    if not txdot.empty:
-        txdot["geometry_obj"] = txdot["Geometry"].map(parse_geometry)
-        txdot = txdot[txdot["geometry_obj"].notna()].copy()
-        txdot_gdf = gpd.GeoDataFrame(txdot, geometry="geometry_obj", crs="EPSG:4326")
-        txdot_gdf.to_file(OUTPUT_GPKG, layer="txdot_segments", driver="GPKG")
+    print(
+        f"Saved corridor layer: "
+        f"{len(network)} links"
+    )
 
-    print(f"Saved: {OUTPUT_GPKG}")
-    print(f"corridor_links: {len(corridor_gdf):,}")
-    print(f"txdot_segments: {len(txdot):,}")
+    # Step 4: Extract relevant TxDOT segments
+    txdot = extract_txdot_segments(
+        corridor
+    )
+
+    if txdot is not None:
+
+        txdot.to_file(
+            OUTPUT_GPKG,
+            layer="txdot_segments",
+            driver="GPKG",
+        )
+
+        print(
+            f"Saved TxDOT layer: "
+            f"{len(txdot):,} segments"
+        )
+
+    print()
+    print(
+        f"QGIS file:\n{OUTPUT_GPKG}"
+    )
 
 
 if __name__ == "__main__":

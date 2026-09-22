@@ -1,258 +1,627 @@
+import time
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 
-PROJECT_ROOT = Path(r"D:\Sabin\Streetlight-Data-Processing")
-MOE_DIR = PROJECT_ROOT / "MOE for selected links"
-RESULTS_DIR = MOE_DIR / "Results"
+# Paths and settings
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-INPUT_FILE = PROJECT_ROOT / "Output" / "Final" / "9_20_2025" / "9_20_2025_hr=19.csv"
+INPUT_FILE = (
+    PROJECT_ROOT
+    / "Output"
+    / "Final"
+    / "9_20_2025"
+    / "9_20_2025_hr=19.csv"
+)
+
+RESULTS_DIR = Path(__file__).resolve().parent / "Results"
+
 SELECTED_LINKS_FILE = RESULTS_DIR / "selected_links.csv"
-MOE_OUTPUT_FILE = RESULTS_DIR / "link_moe_5min.csv"
+OUTPUT_FILE = RESULTS_DIR / "link_moe_5min.csv"
 
-CHUNK_SIZE = 1_000_000
 TIME_BIN_MINUTES = 5
-TRIP_GAP_SECONDS = 120
 SLOW_SPEED_THRESHOLD_MPH = 5.0
+MAX_WAYPOINT_GAP_SECONDS = 120
+CHUNK_SIZE = 1_000_000
 
-USE_COLUMNS = ["journey_id", "capture_time", "local_time", "speed_mph", "link_key"]
+USE_COLUMNS = [
+    "journey_id",
+    "capture_time",
+    "local_time",
+    "link_key",
+    "speed_mph",
+]
 
 
+# Load links selected only from CV data availability
 def load_selected_links():
-    df = pd.read_csv(SELECTED_LINKS_FILE, dtype={"link_key": "string"})
-    return set(df["link_key"].dropna().astype(str))
+
+    selected = pd.read_csv(
+        SELECTED_LINKS_FILE,
+        dtype={"link_key": "string"},
+    )
+
+    return selected, set(selected["link_key"])
 
 
-def prepare_batch(batch):
-    batch = batch.copy()
-    batch["link_key"] = batch["link_key"].astype("string")
-    batch["speed_mph"] = pd.to_numeric(batch["speed_mph"], errors="coerce")
-    batch["event_time"] = pd.to_datetime(batch["local_time"], errors="coerce")
-    batch = batch.sort_values(["journey_id", "event_time"], kind="mergesort").reset_index(drop=True)
+# Split journeys at gaps greater than 2 minutes and identify link runs
+def prepare_link_sequence(df):
 
-    same_journey = batch["journey_id"].eq(batch["journey_id"].shift())
-    gap_s = (batch["event_time"] - batch["event_time"].shift()).dt.total_seconds()
-    matched = batch["link_key"].notna()
-    previous_matched = matched.shift(fill_value=False)
+    data = df[
+        df["journey_id"].notna()
+    ].copy()
+
+    data = data.sort_values(
+        ["journey_id", "capture_time"]
+    ).reset_index(drop=True)
+
+    data["local_time"] = pd.to_datetime(
+        data["local_time"]
+    )
+
+    new_journey = (
+        data["journey_id"]
+        .ne(data["journey_id"].shift())
+    )
+
+    time_gap = (
+        data.groupby(
+            "journey_id",
+            sort=False,
+        )["capture_time"]
+        .diff()
+    )
 
     new_trip = (
-        ~same_journey
-        | gap_s.gt(TRIP_GAP_SECONDS).fillna(False)
-        | ~matched
-        | ~previous_matched
+        new_journey
+        | (time_gap > MAX_WAYPOINT_GAP_SECONDS)
     )
-    batch["trip_segment"] = np.cumsum(new_trip.to_numpy(dtype=bool, na_value=True))
 
-    new_run = new_trip | batch["link_key"].ne(batch["link_key"].shift()).fillna(True)
-    batch["run_id"] = np.cumsum(new_run.to_numpy(dtype=bool, na_value=True))
-    batch["time_bin"] = batch["event_time"].dt.floor(f"{TIME_BIN_MINUTES}min")
-    return batch
+    data["trip_segment_id"] = np.cumsum(
+        new_trip.to_numpy(
+            dtype=bool,
+            na_value=True,
+        )
+    )
+
+    link_for_compare = (
+        data["link_key"]
+        .fillna("__UNMATCHED__")
+    )
+
+    new_run = (
+        new_trip
+        | link_for_compare.ne(
+            link_for_compare.shift()
+        )
+    )
+
+    data["run_id"] = np.cumsum(
+        new_run.to_numpy(
+            dtype=bool,
+            na_value=True,
+        )
+    )
+
+    data["time_bin"] = (
+        data["local_time"]
+        .dt.floor(f"{TIME_BIN_MINUTES}min")
+    )
+
+    return data
 
 
-def waypoint_metrics(batch, selected_links):
-    valid = batch[
-        batch["link_key"].isin(selected_links)
-        & batch["event_time"].notna()
-        & batch["speed_mph"].notna()
-        & batch["speed_mph"].ge(0)
+# Calculate slow movements and DSH for each time bin
+def calculate_speed_moes(data, selected_links):
+
+    selected = data[
+        data["link_key"].isin(selected_links)
+        & data["speed_mph"].notna()
+        & np.isfinite(data["speed_mph"])
+        & (data["speed_mph"] >= 0)
     ].copy()
-    if valid.empty:
-        return pd.DataFrame()
 
-    valid["slow"] = valid["speed_mph"] < SLOW_SPEED_THRESHOLD_MPH
-    valid["slow_speed"] = valid["speed_mph"].where(valid["slow"], 0.0)
+    if selected.empty:
+        return None, None
 
-    return (
-        valid.groupby(["link_key", "time_bin"], observed=True)
+    selected = selected.sort_values(
+        ["journey_id", "capture_time"]
+    )
+
+    selected["is_slow"] = (
+        selected["speed_mph"]
+        < SLOW_SPEED_THRESHOLD_MPH
+    )
+
+    selected["slow_speed"] = np.where(
+        selected["is_slow"],
+        selected["speed_mph"],
+        0.0,
+    )
+
+    # Basic statistics for each link and time bin
+    basic = (
+        selected.groupby(
+            ["link_key", "time_bin"],
+            as_index=False,
+        )
         .agg(
             waypoint_count=("speed_mph", "size"),
             journey_count=("journey_id", "nunique"),
-            total_speed=("speed_mph", "sum"),
-            slow_movement_count=("slow", "sum"),
+            total_speed_sum=("speed_mph", "sum"),
+            slow_movement_count=("is_slow", "sum"),
             slow_speed_sum=("slow_speed", "sum"),
         )
-        .reset_index()
     )
 
+    # Calculate consecutive speed changes independently within each time bin
+    selected["speed_change"] = (
+        selected.groupby(
+            ["run_id", "time_bin"],
+            sort=False,
+        )["speed_mph"]
+        .diff()
+        .abs()
+    )
 
-def dsh_metrics(batch, selected_links):
-    valid = batch[
-        batch["link_key"].isin(selected_links)
-        & batch["event_time"].notna()
-        & batch["speed_mph"].notna()
-        & batch["speed_mph"].ge(0)
+    # Summarize continuous link visits within each time bin
+    run_dsh = (
+        selected.groupby(
+            [
+                "trip_segment_id",
+                "journey_id",
+                "link_key",
+                "run_id",
+                "time_bin",
+            ],
+            as_index=False,
+        )
+        .agg(
+            waypoint_count=("speed_mph", "size"),
+            speed_change_sum=("speed_change", "sum"),
+        )
+    )
+
+    # DSH requires at least two waypoint speeds
+    run_dsh = run_dsh[
+        run_dsh["waypoint_count"] >= 2
     ].copy()
-    if valid.empty:
-        return pd.DataFrame()
 
-    groups = ["link_key", "time_bin", "journey_id", "trip_segment", "run_id"]
-    valid["speed_change"] = valid.groupby(groups, observed=True)["speed_mph"].diff().abs()
-
-    trip = (
-        valid.groupby(groups, observed=True)
-        .agg(n_speeds=("speed_mph", "size"), speed_change_sum=("speed_change", "sum"))
-        .reset_index()
-    )
-    # Paper Eq. 5: denominator is n waypoint speeds, not n - 1.
-    trip["trip_DSH"] = trip["speed_change_sum"] / trip["n_speeds"]
-
-    return (
-        trip.groupby(["link_key", "time_bin"], observed=True)
-        .agg(dsh_trip_count=("trip_DSH", "size"), dsh_sum=("trip_DSH", "sum"))
-        .reset_index()
+    # Combine repeated visits within the same trip and time bin
+    trip_dsh = (
+        run_dsh.groupby(
+            [
+                "trip_segment_id",
+                "journey_id",
+                "link_key",
+                "time_bin",
+            ],
+            as_index=False,
+        )
+        .agg(
+            waypoint_count=("waypoint_count", "sum"),
+            speed_change_sum=("speed_change_sum", "sum"),
+        )
     )
 
+    # Paper definition uses n waypoint speeds as the denominator
+    trip_dsh["trip_dsh"] = (
+        trip_dsh["speed_change_sum"]
+        / trip_dsh["waypoint_count"]
+    )
 
-def travel_time_metrics(batch, selected_links):
-    matched = batch[batch["link_key"].notna() & batch["event_time"].notna()].copy()
-    if matched.empty:
-        return pd.DataFrame()
+    # Average trip-level DSH for each link and time bin
+    dsh = (
+        trip_dsh.groupby(
+            ["link_key", "time_bin"],
+            as_index=False,
+        )
+        .agg(
+            dsh_sum=("trip_dsh", "sum"),
+            dsh_trip_count=("trip_dsh", "size"),
+        )
+    )
+
+    return basic, dsh
+
+
+# Calculate complete link travel times and assign them to entry time bins
+def calculate_travel_times(data, selected_links):
+
+    if data.empty:
+        return None
 
     runs = (
-        matched.groupby(["journey_id", "trip_segment", "run_id", "link_key"], observed=True)
-        .agg(entry_time=("event_time", "min"))
-        .reset_index()
-        .sort_values(["journey_id", "trip_segment", "entry_time", "run_id"], kind="mergesort")
+        data.groupby(
+            "run_id",
+            as_index=False,
+            sort=False,
+        )
+        .agg(
+            trip_segment_id=("trip_segment_id", "first"),
+            journey_id=("journey_id", "first"),
+            link_key=("link_key", "first"),
+            entry_time=("capture_time", "first"),
+            entry_local_time=("local_time", "first"),
+        )
     )
 
-    group = ["journey_id", "trip_segment"]
-    runs["previous_link"] = runs.groupby(group, observed=True)["link_key"].shift(1)
-    runs["next_link"] = runs.groupby(group, observed=True)["link_key"].shift(-1)
-    runs["next_entry_time"] = runs.groupby(group, observed=True)["entry_time"].shift(-1)
+    runs = runs.sort_values(
+        "run_id"
+    ).reset_index(drop=True)
 
+    runs["previous_trip"] = (
+        runs["trip_segment_id"].shift()
+    )
+
+    runs["next_trip"] = (
+        runs["trip_segment_id"].shift(-1)
+    )
+
+    runs["previous_link"] = (
+        runs["link_key"].shift()
+    )
+
+    runs["next_link"] = (
+        runs["link_key"].shift(-1)
+    )
+
+    runs["next_entry_time"] = (
+        runs["entry_time"].shift(-1)
+    )
+
+    # Keep only fully observed traversals within the same trip
     complete = runs[
         runs["link_key"].isin(selected_links)
+        & (
+            runs["trip_segment_id"]
+            == runs["previous_trip"]
+        )
+        & (
+            runs["trip_segment_id"]
+            == runs["next_trip"]
+        )
         & runs["previous_link"].notna()
         & runs["next_link"].notna()
-        & runs["next_entry_time"].notna()
     ].copy()
-    if complete.empty:
-        return pd.DataFrame()
 
-    complete["travel_time_s"] = (complete["next_entry_time"] - complete["entry_time"]).dt.total_seconds()
-    complete = complete[complete["travel_time_s"].gt(0)].copy()
     if complete.empty:
-        return pd.DataFrame()
+        return None
 
-    complete["time_bin"] = complete["entry_time"].dt.floor(f"{TIME_BIN_MINUTES}min")
-    return (
-        complete.groupby(["link_key", "time_bin"], observed=True)
-        .agg(
-            complete_traversal_count=("travel_time_s", "size"),
-            travel_time_sum_s=("travel_time_s", "sum"),
+    complete["travel_time_s"] = (
+        complete["next_entry_time"]
+        - complete["entry_time"]
+    )
+
+    complete = complete[
+        complete["travel_time_s"] > 0
+    ].copy()
+
+    # Travel time belongs to the time period when the vehicle entered the link
+    complete["time_bin"] = (
+        pd.to_datetime(
+            complete["entry_local_time"]
         )
-        .reset_index()
+        .dt.floor(f"{TIME_BIN_MINUTES}min")
     )
 
-
-def combine(frames, values):
-    frames = [x for x in frames if not x.empty]
-    if not frames:
-        return pd.DataFrame()
-    return (
-        pd.concat(frames, ignore_index=True)
-        .groupby(["link_key", "time_bin"], observed=True)[values]
-        .sum()
-        .reset_index()
+    travel = (
+        complete.groupby(
+            ["link_key", "time_bin"],
+            as_index=False,
+        )
+        .agg(
+            travel_time_sum=("travel_time_s", "sum"),
+            complete_traversal_count=("travel_time_s", "size"),
+        )
     )
 
+    return travel
 
-def process_batch(batch, selected_links):
-    batch = prepare_batch(batch)
-    return (
-        waypoint_metrics(batch, selected_links),
-        dsh_metrics(batch, selected_links),
-        travel_time_metrics(batch, selected_links),
+
+# Combine chunk results into final 5-minute MOEs
+def combine_results(
+    basic_parts,
+    dsh_parts,
+    travel_parts,
+):
+
+    basic = (
+        pd.concat(
+            basic_parts,
+            ignore_index=True,
+        )
+        .groupby(
+            ["link_key", "time_bin"],
+            as_index=False,
+        )
+        .agg(
+            waypoint_count=("waypoint_count", "sum"),
+            journey_count=("journey_count", "sum"),
+            total_speed_sum=("total_speed_sum", "sum"),
+            slow_movement_count=("slow_movement_count", "sum"),
+            slow_speed_sum=("slow_speed_sum", "sum"),
+        )
     )
+
+    # Slow movement percentage from Eq. 6
+    basic["slow_movement_pct"] = np.where(
+        basic["total_speed_sum"] > 0,
+        (
+            100
+            * basic["slow_speed_sum"]
+            / basic["total_speed_sum"]
+        ),
+        np.nan,
+    )
+
+    # Combine DSH
+    if dsh_parts:
+
+        dsh = (
+            pd.concat(
+                dsh_parts,
+                ignore_index=True,
+            )
+            .groupby(
+                ["link_key", "time_bin"],
+                as_index=False,
+            )
+            .agg(
+                dsh_sum=("dsh_sum", "sum"),
+                dsh_trip_count=("dsh_trip_count", "sum"),
+            )
+        )
+
+        dsh["DSH"] = (
+            dsh["dsh_sum"]
+            / dsh["dsh_trip_count"]
+        )
+
+        dsh = dsh.drop(
+            columns=["dsh_sum"]
+        )
+
+        basic = basic.merge(
+            dsh,
+            on=["link_key", "time_bin"],
+            how="left",
+        )
+
+    else:
+
+        basic["dsh_trip_count"] = 0
+        basic["DSH"] = np.nan
+
+    # Combine travel time
+    if travel_parts:
+
+        travel = (
+            pd.concat(
+                travel_parts,
+                ignore_index=True,
+            )
+            .groupby(
+                ["link_key", "time_bin"],
+                as_index=False,
+            )
+            .agg(
+                travel_time_sum=("travel_time_sum", "sum"),
+                complete_traversal_count=(
+                    "complete_traversal_count",
+                    "sum",
+                ),
+            )
+        )
+
+        travel["avg_travel_time_s"] = (
+            travel["travel_time_sum"]
+            / travel["complete_traversal_count"]
+        )
+
+        travel = travel.drop(
+            columns=["travel_time_sum"]
+        )
+
+        basic = basic.merge(
+            travel,
+            on=["link_key", "time_bin"],
+            how="left",
+        )
+
+    else:
+
+        basic["complete_traversal_count"] = 0
+        basic["avg_travel_time_s"] = np.nan
+
+    basic = basic.drop(
+        columns=[
+            "total_speed_sum",
+            "slow_speed_sum",
+        ]
+    )
+
+    return basic.sort_values(
+        ["link_key", "time_bin"]
+    ).reset_index(drop=True)
 
 
 def main():
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    selected_links = load_selected_links()
 
-    waypoint_parts, dsh_parts, travel_parts = [], [], []
+    start_time = time.perf_counter()
+
+    RESULTS_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    # Step 1: Load coverage-selected links
+    selected, selected_links = load_selected_links()
+
+    print("5-MINUTE LINK MOE PROCESSING")
+    print("=" * 70)
+    print(f"Selected links:     {len(selected):,}")
+    print(f"Time bin:           {TIME_BIN_MINUTES} minutes")
+    print(f"Slow threshold:     < {SLOW_SPEED_THRESHOLD_MPH} mph")
+    print(f"Maximum trip gap:   {MAX_WAYPOINT_GAP_SECONDS} seconds")
+    print()
+
+    basic_parts = []
+    dsh_parts = []
+    travel_parts = []
+
     carry = pd.DataFrame()
+    total_rows = 0
 
+    # Step 2: Read the complete hourly CV file in chunks
     reader = pd.read_csv(
         INPUT_FILE,
         usecols=USE_COLUMNS,
         chunksize=CHUNK_SIZE,
-        dtype={"journey_id": "string", "link_key": "string"},
-        low_memory=False,
+        dtype={
+            "journey_id": "string",
+            "link_key": "string",
+            "speed_mph": "float64",
+        },
     )
 
-    for chunk_number, chunk in enumerate(reader, start=1):
+    for chunk_number, chunk in enumerate(
+        reader,
+        start=1,
+    ):
+
+        total_rows += len(chunk)
+
+        # Step 3: Add unfinished journey from previous chunk
         if not carry.empty:
-            chunk = pd.concat([carry, chunk], ignore_index=True)
-            carry = pd.DataFrame()
-        if chunk.empty:
+
+            chunk = pd.concat(
+                [carry, chunk],
+                ignore_index=True,
+            )
+
+        last_journey = (
+            chunk["journey_id"].iloc[-1]
+        )
+
+        # Step 4: Carry final journey into next chunk
+        carry = chunk[
+            chunk["journey_id"]
+            == last_journey
+        ].copy()
+
+        complete_chunk = chunk[
+            chunk["journey_id"]
+            != last_journey
+        ].copy()
+
+        if complete_chunk.empty:
             continue
 
-        last_journey = chunk["journey_id"].iloc[-1]
-        carry = chunk[chunk["journey_id"] == last_journey].copy()
-        complete = chunk[chunk["journey_id"] != last_journey].copy()
+        # Step 5: Split trips and build link sequences
+        sequence = prepare_link_sequence(
+            complete_chunk
+        )
 
-        if not complete.empty:
-            waypoint, dsh, travel = process_batch(complete, selected_links)
-            waypoint_parts.append(waypoint)
+        # Step 6: Calculate slow movement and DSH
+        basic, dsh = calculate_speed_moes(
+            sequence,
+            selected_links,
+        )
+
+        if basic is not None:
+            basic_parts.append(basic)
+
+        if dsh is not None and not dsh.empty:
             dsh_parts.append(dsh)
+
+        # Step 7: Calculate complete link travel times
+        travel = calculate_travel_times(
+            sequence,
+            selected_links,
+        )
+
+        if travel is not None and not travel.empty:
             travel_parts.append(travel)
 
-        print(f"Chunk {chunk_number:,}: rows={len(chunk):,}, carry={len(carry):,}")
+        print(
+            f"Chunk {chunk_number:>3} | "
+            f"Rows processed: {total_rows:,}"
+        )
 
+    # Step 8: Process final journey
     if not carry.empty:
-        waypoint, dsh, travel = process_batch(carry, selected_links)
-        waypoint_parts.append(waypoint)
-        dsh_parts.append(dsh)
-        travel_parts.append(travel)
 
-    waypoint = combine(
-        waypoint_parts,
-        ["waypoint_count", "journey_count", "total_speed", "slow_movement_count", "slow_speed_sum"],
+        sequence = prepare_link_sequence(
+            carry
+        )
+
+        basic, dsh = calculate_speed_moes(
+            sequence,
+            selected_links,
+        )
+
+        if basic is not None:
+            basic_parts.append(basic)
+
+        if dsh is not None and not dsh.empty:
+            dsh_parts.append(dsh)
+
+        travel = calculate_travel_times(
+            sequence,
+            selected_links,
+        )
+
+        if travel is not None and not travel.empty:
+            travel_parts.append(travel)
+
+    # Step 9: Combine 5-minute results
+    result = combine_results(
+        basic_parts,
+        dsh_parts,
+        travel_parts,
     )
-    dsh = combine(dsh_parts, ["dsh_trip_count", "dsh_sum"])
-    travel = combine(travel_parts, ["complete_traversal_count", "travel_time_sum_s"])
 
-    result = waypoint.merge(dsh, on=["link_key", "time_bin"], how="left").merge(
-        travel, on=["link_key", "time_bin"], how="left"
+    # Step 10: Round final MOE values
+    result["slow_movement_pct"] = (
+        result["slow_movement_pct"].round(3)
     )
 
-    for column in ["dsh_trip_count", "dsh_sum", "complete_traversal_count", "travel_time_sum_s"]:
-        if column not in result.columns:
-            result[column] = 0.0
-
-    result["slow_movement_pct"] = np.where(
-        result["total_speed"].gt(0), result["slow_speed_sum"] / result["total_speed"] * 100.0, np.nan
-    )
-    result["DSH"] = np.where(
-        result["dsh_trip_count"].gt(0), result["dsh_sum"] / result["dsh_trip_count"], np.nan
-    )
-    result["avg_travel_time_s"] = np.where(
-        result["complete_traversal_count"].gt(0),
-        result["travel_time_sum_s"] / result["complete_traversal_count"],
-        np.nan,
+    result["DSH"] = (
+        result["DSH"].round(3)
     )
 
-    result = result[
-        [
-            "link_key",
-            "time_bin",
-            "waypoint_count",
-            "journey_count",
-            "slow_movement_count",
-            "slow_movement_pct",
-            "dsh_trip_count",
-            "DSH",
-            "complete_traversal_count",
-            "avg_travel_time_s",
-        ]
-    ].sort_values(["link_key", "time_bin"])
+    result["avg_travel_time_s"] = (
+        result["avg_travel_time_s"].round(3)
+    )
 
-    result.to_csv(MOE_OUTPUT_FILE, index=False)
-    print(f"Rows written: {len(result):,}")
-    print(f"Saved: {MOE_OUTPUT_FILE}")
+    # Step 11: Save the 5-minute MOE table
+    result.to_csv(
+        OUTPUT_FILE,
+        index=False,
+    )
+
+    runtime = (
+        time.perf_counter()
+        - start_time
+    )
+
+    print()
+    print("=" * 70)
+    print("5-MINUTE MOE PROCESSING COMPLETE")
+    print(f"Selected links: {len(selected):,}")
+    print(f"MOE rows:       {len(result):,}")
+    print(f"Runtime:        {runtime / 60:.2f} min")
+    print(f"Output:         {OUTPUT_FILE}")
+
+    print()
+    print("FIRST 20 RESULTS")
+    print(
+        result.head(20)
+        .to_string(index=False)
+    )
 
 
 if __name__ == "__main__":

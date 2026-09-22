@@ -1,380 +1,1521 @@
+import re
+import time
 from pathlib import Path
-from collections import Counter, defaultdict
-import json
 
-import geopandas as gpd
 import numpy as np
 import pandas as pd
+from pyproj import Transformer
 from shapely import wkt
-from shapely.geometry import shape
+from shapely.ops import transform as shapely_transform
 
 
-PROJECT_ROOT = Path(r"D:\Sabin\Streetlight-Data-Processing")
-MOE_DIR = PROJECT_ROOT / "MOE for selected links"
-RESULTS_DIR = MOE_DIR / "Results"
+# Paths and settings
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-CV_FILE = PROJECT_ROOT / "Output" / "Final" / "9_20_2025" / "9_20_2025_hr=19.csv"
-NETWORK_FILE = PROJECT_ROOT / "Initial Input Files" / "OSM_Short_Level_CSV" / "Complete_OSM_Short_Level_Link_List.csv"
-TXDOT_FILE = PROJECT_ROOT / "Initial Input Files" / "TxDOT" / "link_list_with_speed_NOL.csv"
-OUTPUT_FILE = RESULTS_DIR / "corridor_links.csv"
+CV_FILE = (
+    PROJECT_ROOT
+    / "Output"
+    / "Final"
+    / "9_20_2025"
+    / "9_20_2025_hr=19.csv"
+)
 
-CHUNK_SIZE = 1_000_000
-TRIP_GAP_SECONDS = 120
+NETWORK_FILE = (
+    PROJECT_ROOT
+    / "Initial Input Files"
+    / "OSM_Short_Level_CSV"
+    / "Complete_OSM_Short_Level_Link_List.csv"
+)
+
+TXDOT_FILE = (
+    PROJECT_ROOT
+    / "Initial Input Files"
+    / "TxDOT"
+    / "link_list_with_speed_NOL.csv"
+)
+
+RESULTS_DIR = Path(__file__).resolve().parent / "Results"
+
+CORRIDOR_FILE = RESULTS_DIR / "corridor_links.csv"
+
+CV_CHUNK_SIZE = 1_000_000
+NETWORK_CHUNK_SIZE = 500_000
+TXDOT_CHUNK_SIZE = 500_000
+
+MAX_WAYPOINT_GAP_SECONDS = 120
+
+# None = automatically choose a high-support starting link
+START_LINK_KEY = None
+
+# Display extent only
 MAX_CORRIDOR_LINKS = 40
+
+# Conservative spatial matching checks
 MAX_TXDOT_MATCH_DISTANCE_FT = 100.0
 MAX_TXDOT_HEADING_DIFFERENCE_DEG = 35.0
-MANUAL_START_LINK = None
+
+SOURCE_CRS = "EPSG:4326"
+PROJECTED_CRS = "EPSG:3083"
+
+M_TO_FT = 3.280839895
+
+TRANSFORMER = Transformer.from_crs(
+    SOURCE_CRS,
+    PROJECTED_CRS,
+    always_xy=True,
+)
 
 
-def normalize_gid(value):
-    if pd.isna(value):
-        return None
-    text = str(value).strip()
-    if text.endswith(".0"):
-        text = text[:-2]
-    return None if text in {"", "nan", "None", "-1"} else text
+# Split CV journeys and identify consecutive roadway-link runs
+def prepare_link_runs(df):
 
+    data = df[
+        df["journey_id"].notna()
+    ].copy()
 
-def parse_geometry(value):
-    if value is None or pd.isna(value):
-        return None
-    text = str(value).strip()
-    try:
-        return shape(json.loads(text)) if text.startswith("{") else wkt.loads(text)
-    except Exception:
-        return None
+    if data.empty:
+        return pd.DataFrame()
 
+    data = data.sort_values(
+        ["journey_id", "capture_time"]
+    ).reset_index(drop=True)
 
-def angular_difference(a, b):
-    if pd.isna(a) or pd.isna(b):
-        return np.nan
-    return abs(((float(a) - float(b) + 180.0) % 360.0) - 180.0)
-
-
-def link_family(link_key):
-    parts = str(link_key).split("_")
-    return "_".join(parts[:2]) if len(parts) >= 2 else str(link_key)
-
-
-def count_transitions(batch, counts, outgoing_total):
-    batch = batch.copy()
-    batch["capture_time"] = pd.to_datetime(batch["capture_time"], errors="coerce")
-    batch = batch.sort_values(["journey_id", "capture_time"], kind="mergesort")
-
-    previous_journey = batch["journey_id"].shift()
-    previous_time = batch["capture_time"].shift()
-    previous_link = batch["link_key"].shift()
-    gap = (batch["capture_time"] - previous_time).dt.total_seconds()
-
-    valid = (
-        batch["journey_id"].eq(previous_journey)
-        & gap.le(TRIP_GAP_SECONDS)
-        & batch["link_key"].notna()
-        & previous_link.notna()
-        & batch["link_key"].ne(previous_link)
+    new_journey = (
+        data["journey_id"]
+        .ne(data["journey_id"].shift())
     )
 
-    transitions = pd.DataFrame(
-        {
-            "from_link": previous_link[valid].astype(str),
-            "to_link": batch.loc[valid, "link_key"].astype(str),
-        }
+    time_gap = (
+        data.groupby(
+            "journey_id",
+            sort=False,
+        )["capture_time"]
+        .diff()
     )
-    grouped = transitions.value_counts().rename("count").reset_index()
 
-    for row in grouped.itertuples(index=False):
-        counts[(row.from_link, row.to_link)] += int(row.count)
-        outgoing_total[row.from_link] += int(row.count)
+    new_trip = (
+        new_journey
+        | (time_gap > MAX_WAYPOINT_GAP_SECONDS)
+    )
+
+    data["trip_segment_id"] = np.cumsum(
+        new_trip.to_numpy(
+            dtype=bool,
+            na_value=True,
+        )
+    )
+
+    link_compare = (
+        data["link_key"]
+        .fillna("__UNMATCHED__")
+    )
+
+    link_change = (
+        link_compare
+        .ne(link_compare.shift())
+        .fillna(True)
+    )
+
+    new_run = (
+        new_trip
+        | link_change
+    )
+
+    data["run_id"] = np.cumsum(
+        new_run.to_numpy(
+            dtype=bool,
+            na_value=True,
+        )
+    )
+
+    runs = (
+        data.groupby(
+            "run_id",
+            as_index=False,
+            sort=False,
+        )
+        .agg(
+            trip_segment_id=("trip_segment_id", "first"),
+            link_key=("link_key", "first"),
+        )
+    )
+
+    return runs
 
 
-def build_transition_support():
-    counts = Counter()
-    outgoing_total = Counter()
+# Count observed directional transitions between matched CV links
+def calculate_transition_counts(df):
+
+    runs = prepare_link_runs(df)
+
+    if runs.empty:
+        return None
+
+    runs["next_trip"] = (
+        runs["trip_segment_id"]
+        .shift(-1)
+    )
+
+    runs["next_link"] = (
+        runs["link_key"]
+        .shift(-1)
+    )
+
+    transitions = runs[
+        (runs["trip_segment_id"] == runs["next_trip"])
+        & runs["link_key"].notna()
+        & runs["next_link"].notna()
+        & (runs["link_key"] != runs["next_link"])
+    ].copy()
+
+    if transitions.empty:
+        return None
+
+    return (
+        transitions.groupby(
+            ["link_key", "next_link"],
+            as_index=False,
+        )
+        .size()
+        .rename(
+            columns={
+                "size": "transition_count"
+            }
+        )
+    )
+
+
+# Read the hourly CV file and aggregate link-to-link transition support
+def build_transition_table():
+
+    parts = []
+
     carry = pd.DataFrame()
+    total_rows = 0
 
     reader = pd.read_csv(
         CV_FILE,
-        usecols=["journey_id", "capture_time", "link_key"],
-        chunksize=CHUNK_SIZE,
-        dtype={"journey_id": "string", "link_key": "string"},
-        low_memory=False,
+        usecols=[
+            "journey_id",
+            "capture_time",
+            "link_key",
+        ],
+        chunksize=CV_CHUNK_SIZE,
+        dtype={
+            "journey_id": "string",
+            "link_key": "string",
+        },
     )
 
-    for number, chunk in enumerate(reader, start=1):
-        if not carry.empty:
-            chunk = pd.concat([carry, chunk], ignore_index=True)
-            carry = pd.DataFrame()
+    for chunk_number, chunk in enumerate(
+        reader,
+        start=1,
+    ):
+
+        total_rows += len(chunk)
+
+        chunk = chunk[
+            chunk["journey_id"].notna()
+        ].copy()
+
         if chunk.empty:
             continue
 
-        last_journey = chunk["journey_id"].iloc[-1]
-        carry = chunk[chunk["journey_id"] == last_journey].copy()
-        complete = chunk[chunk["journey_id"] != last_journey].copy()
+        if not carry.empty:
+
+            chunk = pd.concat(
+                [carry, chunk],
+                ignore_index=True,
+            )
+
+        last_journey = (
+            chunk["journey_id"].iloc[-1]
+        )
+
+        carry = chunk[
+            chunk["journey_id"]
+            == last_journey
+        ].copy()
+
+        complete = chunk[
+            chunk["journey_id"]
+            != last_journey
+        ].copy()
+
         if not complete.empty:
-            count_transitions(complete, counts, outgoing_total)
-        print(f"Transition chunk {number:,}")
+
+            result = calculate_transition_counts(
+                complete
+            )
+
+            if result is not None:
+                parts.append(result)
+
+        print(
+            f"CV chunk {chunk_number:>3} | "
+            f"Rows processed: {total_rows:,}"
+        )
 
     if not carry.empty:
-        count_transitions(carry, counts, outgoing_total)
 
-    return counts, outgoing_total
+        result = calculate_transition_counts(
+            carry
+        )
+
+        if result is not None:
+            parts.append(result)
+
+    transitions = (
+        pd.concat(
+            parts,
+            ignore_index=True,
+        )
+        .groupby(
+            ["link_key", "next_link"],
+            as_index=False,
+        )["transition_count"]
+        .sum()
+    )
+
+    return transitions
 
 
-def load_network():
-    requested = [
-        "link_key", "from_node_id", "to_node_id", "geometry", "heading", "length",
-        "Matched_GID", "name", "facility_type", "RDBD_TYPE", "Functional Class",
+# Load lightweight OSM short-link topology for network-connected path building
+def load_network_topology():
+
+    use_columns = [
+        "link_key",
+        "from_node_id",
+        "to_node_id",
+        "heading",
+        "length",
     ]
-    try:
-        network = pd.read_csv(NETWORK_FILE, usecols=requested, dtype="string", low_memory=False)
-    except ValueError:
-        fallback = [
-            "link_key", "from_node_id", "to_node_id", "geometry", "heading", "length",
-            "matched_gid", "name", "facility_type", "rdbd_type", "functional_class",
+
+    parts = []
+    total_rows = 0
+
+    reader = pd.read_csv(
+        NETWORK_FILE,
+        usecols=use_columns,
+        chunksize=NETWORK_CHUNK_SIZE,
+        dtype={
+            "link_key": "string",
+        },
+    )
+
+    for chunk_number, chunk in enumerate(
+        reader,
+        start=1,
+    ):
+
+        total_rows += len(chunk)
+
+        parts.append(chunk)
+
+        if chunk_number % 10 == 0:
+
+            print(
+                f"Network topology chunk {chunk_number:>3} | "
+                f"Rows loaded: {total_rows:,}"
+            )
+
+    topology = pd.concat(
+        parts,
+        ignore_index=True,
+    )
+
+    topology["from_node_id"] = pd.to_numeric(
+        topology["from_node_id"],
+        errors="coerce",
+    )
+
+    topology["to_node_id"] = pd.to_numeric(
+        topology["to_node_id"],
+        errors="coerce",
+    )
+
+    topology["heading"] = pd.to_numeric(
+        topology["heading"],
+        errors="coerce",
+    )
+
+    topology["length"] = pd.to_numeric(
+        topology["length"],
+        errors="coerce",
+    )
+
+    topology = topology[
+        topology["link_key"].notna()
+        & topology["from_node_id"].notna()
+        & topology["to_node_id"].notna()
+    ].copy()
+
+    print()
+    print(
+        f"Network topology links loaded: "
+        f"{len(topology):,}"
+    )
+
+    return topology
+
+
+# Return the smallest circular difference between two headings
+def heading_difference(
+    heading_a,
+    heading_b,
+):
+
+    if (
+        pd.isna(heading_a)
+        or pd.isna(heading_b)
+    ):
+        return np.nan
+
+    difference = abs(
+        float(heading_a)
+        - float(heading_b)
+    )
+
+    return min(
+        difference,
+        360.0 - difference,
+    )
+
+
+# Return the first two pieces of a short-link key
+def get_link_family(link_key):
+
+    parts = str(link_key).split("_")
+
+    if len(parts) >= 2:
+        return "_".join(parts[:2])
+
+    return str(link_key)
+
+
+# Choose a well-supported observed starting link
+def choose_start_link(
+    transitions,
+    topology_by_link,
+):
+
+    if START_LINK_KEY is not None:
+
+        start_link = str(
+            START_LINK_KEY
+        )
+
+        if start_link not in topology_by_link.index:
+
+            raise ValueError(
+                f"START_LINK_KEY not found: "
+                f"{start_link}"
+            )
+
+        return start_link
+
+    support = (
+        transitions.groupby(
+            "link_key"
+        )["transition_count"]
+        .sum()
+        .sort_values(
+            ascending=False
+        )
+    )
+
+    for link_key in support.index:
+
+        link_key = str(link_key)
+
+        if link_key in topology_by_link.index:
+            return link_key
+
+    raise RuntimeError(
+        "No CV transition link was found "
+        "in the roadway topology."
+    )
+
+
+# Build a physically connected directional corridor from network topology
+def build_connected_corridor(
+    transitions,
+    topology,
+):
+
+    topology_by_link = (
+        topology
+        .drop_duplicates(
+            subset=["link_key"],
+            keep="first",
+        )
+        .set_index(
+            "link_key",
+            drop=False,
+        )
+    )
+
+    outgoing = (
+        topology
+        .set_index(
+            "from_node_id",
+            drop=False,
+        )
+        .sort_index()
+    )
+
+    transition_lookup = (
+        transitions
+        .set_index(
+            ["link_key", "next_link"]
+        )["transition_count"]
+    )
+
+    start_link = choose_start_link(
+        transitions,
+        topology_by_link,
+    )
+
+    path = [
+        start_link
+    ]
+
+    transition_support = [
+        np.nan
+    ]
+
+    selection_method = [
+        "start"
+    ]
+
+    visited = {
+        start_link
+    }
+
+    current_link = start_link
+
+    while len(path) < MAX_CORRIDOR_LINKS:
+
+        current = topology_by_link.loc[
+            current_link
         ]
-        network = pd.read_csv(NETWORK_FILE, usecols=fallback, dtype="string", low_memory=False)
-        network = network.rename(
-            columns={
-                "matched_gid": "Matched_GID",
-                "rdbd_type": "RDBD_TYPE",
-                "functional_class": "Functional Class",
-            }
+
+        current_from = current[
+            "from_node_id"
+        ]
+
+        current_to = current[
+            "to_node_id"
+        ]
+
+        current_heading = current[
+            "heading"
+        ]
+
+        current_family = get_link_family(
+            current_link
         )
 
-    for column in ["from_node_id", "to_node_id", "heading", "length"]:
-        network[column] = pd.to_numeric(network[column], errors="coerce")
-
-    network["link_key"] = network["link_key"].astype(str)
-    network["Matched_GID"] = network["Matched_GID"].map(normalize_gid)
-    network["geometry_obj"] = network["geometry"].map(parse_geometry)
-    return network.drop_duplicates("link_key").set_index("link_key", drop=False)
-
-
-def choose_next_link(current_key, previous_key, network, outgoing_by_node, transitions):
-    current = network.loc[current_key]
-    candidates = outgoing_by_node.get(current["to_node_id"], [])
-    choices = []
-
-    for candidate_key in candidates:
-        candidate = network.loc[candidate_key]
-        if previous_key is not None and candidate["to_node_id"] == current["from_node_id"]:
-            continue
-
-        choices.append(
-            {
-                "link_key": candidate_key,
-                "transition_support": transitions.get((current_key, candidate_key), 0),
-                "same_family": int(link_family(current_key) == link_family(candidate_key)),
-                "heading_difference": angular_difference(current["heading"], candidate["heading"]),
-            }
-        )
-
-    if not choices:
-        return None, 0, "dead_end"
-
-    table = pd.DataFrame(choices)
-    table["heading_difference"] = table["heading_difference"].fillna(999.0)
-    best = table.sort_values(
-        ["transition_support", "same_family", "heading_difference"],
-        ascending=[False, False, True],
-    ).iloc[0]
-
-    if best["transition_support"] > 0:
-        method = "topology_cv_transition"
-    elif best["same_family"] == 1:
-        method = "topology_same_family"
-    else:
-        method = "topology_heading"
-
-    return str(best["link_key"]), int(best["transition_support"]), method
-
-
-def build_corridor(network, transitions, outgoing_total):
-    outgoing_by_node = defaultdict(list)
-    for row in network.itertuples():
-        outgoing_by_node[row.from_node_id].append(row.link_key)
-
-    if MANUAL_START_LINK is not None:
-        start_link = str(MANUAL_START_LINK)
-    else:
-        eligible = [(key, value) for key, value in outgoing_total.items() if key in network.index]
-        if not eligible:
-            raise RuntimeError("No transition-supported start link found.")
-        start_link = max(eligible, key=lambda item: item[1])[0]
-
-    rows = []
-    visited = set()
-    current = start_link
-    previous = None
-    method = "start_highest_transition_support"
-
-    for order in range(1, MAX_CORRIDOR_LINKS + 1):
-        if current in visited:
+        if current_to not in outgoing.index:
             break
-        visited.add(current)
-        support = outgoing_total.get(current, 0) if order == 1 else transitions.get((previous, current), 0)
-        rows.append(
-            {
-                "corridor_order": order,
-                "link_key": current,
-                "transition_support": support,
-                "selection_method": method,
-            }
-        )
 
-        next_link, _, next_method = choose_next_link(
-            current, previous, network, outgoing_by_node, transitions
-        )
-        if next_link is None:
+        candidates = outgoing.loc[
+            [current_to]
+        ].copy()
+
+        candidates = candidates[
+            ~candidates["link_key"]
+            .isin(visited)
+        ].copy()
+
+        if candidates.empty:
             break
-        previous, current, method = current, next_link, next_method
 
-    corridor = pd.DataFrame(rows).merge(network.reset_index(drop=True), on="link_key", how="left")
-    corridor["link_length_ft"] = pd.to_numeric(corridor["length"], errors="coerce")
-    corridor["distance_start_ft"] = corridor["link_length_ft"].fillna(0).cumsum().shift(fill_value=0)
-    corridor["distance_end_ft"] = corridor["link_length_ft"].fillna(0).cumsum()
+        # Avoid immediately reversing onto the previous node when alternatives exist
+        non_reverse = candidates[
+            candidates["to_node_id"]
+            != current_from
+        ].copy()
 
-    connected = [np.nan]
-    geometry_gap = [np.nan]
-    for i in range(1, len(corridor)):
-        previous_row = corridor.iloc[i - 1]
-        current_row = corridor.iloc[i]
-        connected.append(previous_row["to_node_id"] == current_row["from_node_id"])
+        if not non_reverse.empty:
+            candidates = non_reverse
 
-        a = previous_row["geometry_obj"]
-        b = current_row["geometry_obj"]
-        if a is None or b is None:
-            geometry_gap.append(np.nan)
+        candidates["transition_support"] = [
+            int(
+                transition_lookup.get(
+                    (
+                        current_link,
+                        str(candidate),
+                    ),
+                    0,
+                )
+            )
+            for candidate in candidates[
+                "link_key"
+            ]
+        ]
+
+        candidates[
+            "heading_difference"
+        ] = candidates[
+            "heading"
+        ].apply(
+            lambda value:
+            heading_difference(
+                current_heading,
+                value,
+            )
+        )
+
+        candidates[
+            "same_link_family"
+        ] = candidates[
+            "link_key"
+        ].apply(
+            lambda value:
+            get_link_family(value)
+            == current_family
+        )
+
+        observed = candidates[
+            candidates[
+                "transition_support"
+            ] > 0
+        ].copy()
+
+        if not observed.empty:
+
+            observed = observed.sort_values(
+                by=[
+                    "transition_support",
+                    "same_link_family",
+                    "heading_difference",
+                ],
+                ascending=[
+                    False,
+                    False,
+                    True,
+                ],
+                na_position="last",
+            )
+
+            selected = observed.iloc[0]
+
+            method = (
+                "observed_cv_transition"
+            )
+
         else:
-            try:
-                a_gdf = gpd.GeoSeries([a], crs="EPSG:4326").to_crs("EPSG:3083")
-                b_gdf = gpd.GeoSeries([b], crs="EPSG:4326").to_crs("EPSG:3083")
-                geometry_gap.append(a_gdf.iloc[0].boundary.geoms[-1].distance(b_gdf.iloc[0].boundary.geoms[0]))
-            except Exception:
-                geometry_gap.append(np.nan)
 
-    corridor["topology_connected_from_previous"] = connected
-    corridor["geometry_connection_gap_ft"] = geometry_gap
+            candidates = candidates.sort_values(
+                by=[
+                    "same_link_family",
+                    "heading_difference",
+                ],
+                ascending=[
+                    False,
+                    True,
+                ],
+                na_position="last",
+            )
+
+            selected = candidates.iloc[0]
+
+            method = (
+                "network_continuity"
+            )
+
+        next_link = str(
+            selected["link_key"]
+        )
+
+        path.append(
+            next_link
+        )
+
+        transition_support.append(
+            int(
+                selected[
+                    "transition_support"
+                ]
+            )
+        )
+
+        selection_method.append(
+            method
+        )
+
+        visited.add(
+            next_link
+        )
+
+        current_link = next_link
+
+    corridor = pd.DataFrame(
+        {
+            "corridor_order": np.arange(
+                1,
+                len(path) + 1,
+            ),
+            "link_key": path,
+            "transition_support": transition_support,
+            "selection_method": selection_method,
+        }
+    )
+
     return corridor
 
 
-def collect_txdot_candidates(gids):
-    gids = {normalize_gid(x) for x in gids if normalize_gid(x) is not None}
-    parts = []
-    usecols = ["LinkID", "GID", "Geometry", "Heading", "SpeedLimit", "RDBD_TYPE", "MAP_LBL", "Ramp_type"]
+# Read full metadata only for corridor links
+def load_corridor_network_metadata(
+    corridor,
+):
 
-    for chunk in pd.read_csv(TXDOT_FILE, usecols=usecols, chunksize=500_000, dtype="string", low_memory=False):
-        chunk["GID_norm"] = chunk["GID"].map(normalize_gid)
-        keep = chunk[chunk["GID_norm"].isin(gids)].copy()
-        if not keep.empty:
-            parts.append(keep)
+    corridor_set = set(
+        corridor["link_key"]
+    )
+
+    use_columns = [
+        "link_key",
+        "from_node_id",
+        "to_node_id",
+        "geometry",
+        "heading",
+        "length",
+        "Matched_GID",
+    ]
+
+    parts = []
+    found = set()
+
+    reader = pd.read_csv(
+        NETWORK_FILE,
+        usecols=use_columns,
+        chunksize=NETWORK_CHUNK_SIZE,
+        dtype={
+            "link_key": "string",
+            "Matched_GID": "string",
+        },
+    )
+
+    for chunk_number, chunk in enumerate(
+        reader,
+        start=1,
+    ):
+
+        matched = chunk[
+            chunk["link_key"]
+            .isin(corridor_set)
+        ].copy()
+
+        if not matched.empty:
+
+            parts.append(matched)
+
+            found.update(
+                matched["link_key"]
+                .dropna()
+                .tolist()
+            )
+
+        if corridor_set.issubset(found):
+            break
+
+        if chunk_number % 10 == 0:
+
+            print(
+                f"Network metadata chunk {chunk_number:>3} | "
+                f"Found: {len(found):,}/"
+                f"{len(corridor_set):,}"
+            )
+
+    metadata = pd.concat(
+        parts,
+        ignore_index=True,
+    )
+
+    metadata = metadata.drop_duplicates(
+        subset=["link_key"],
+        keep="first",
+    )
+
+    return metadata
+
+
+# Convert a valid Matched_GID to the integer TxDOT GID
+def normalize_matched_gid(value):
+
+    if pd.isna(value):
+        return np.nan
+
+    text = str(value).strip()
+
+    if not re.fullmatch(
+        r"\d+(?:\.0+)?",
+        text,
+    ):
+        return np.nan
+
+    gid = int(
+        float(text)
+    )
+
+    if gid <= 0:
+        return np.nan
+
+    return gid
+
+
+# Convert WKT geometry from WGS84 to the project CRS
+def project_wkt_geometry(
+    geometry_text,
+):
+
+    if pd.isna(geometry_text):
+        return None
+
+    try:
+
+        geometry = wkt.loads(
+            str(geometry_text)
+        )
+
+        return shapely_transform(
+            TRANSFORMER.transform,
+            geometry,
+        )
+
+    except Exception:
+
+        return None
+
+
+# Read only TxDOT segments belonging to corridor GIDs
+def load_txdot_candidates(
+    corridor_metadata,
+):
+
+    valid_gids = set(
+        corridor_metadata[
+            "txdot_gid"
+        ]
+        .dropna()
+        .astype(int)
+        .tolist()
+    )
+
+    if not valid_gids:
+        return pd.DataFrame()
+
+    use_columns = [
+        "LinkID",
+        "FromNode",
+        "ToNode",
+        "GID",
+        "Geometry",
+        "Heading",
+        "SpeedLimit",
+        "length",
+    ]
+
+    parts = []
+    total_rows = 0
+    matched_rows = 0
+
+    reader = pd.read_csv(
+        TXDOT_FILE,
+        usecols=use_columns,
+        chunksize=TXDOT_CHUNK_SIZE,
+    )
+
+    for chunk_number, chunk in enumerate(
+        reader,
+        start=1,
+    ):
+
+        total_rows += len(chunk)
+
+        chunk["GID"] = pd.to_numeric(
+            chunk["GID"],
+            errors="coerce",
+        )
+
+        matched = chunk[
+            chunk["GID"]
+            .isin(valid_gids)
+        ].copy()
+
+        if not matched.empty:
+
+            parts.append(matched)
+
+            matched_rows += len(
+                matched
+            )
+
+        if chunk_number % 5 == 0:
+
+            print(
+                f"TxDOT chunk {chunk_number:>3} | "
+                f"Rows scanned: {total_rows:,} | "
+                f"Candidate rows: {matched_rows:,}"
+            )
 
     if not parts:
         return pd.DataFrame()
 
-    result = pd.concat(parts, ignore_index=True)
-    result["Heading"] = pd.to_numeric(result["Heading"], errors="coerce")
-    result["SpeedLimit"] = pd.to_numeric(result["SpeedLimit"], errors="coerce")
-    result["geometry_obj"] = result["Geometry"].map(parse_geometry)
-    return result
+    candidates = pd.concat(
+        parts,
+        ignore_index=True,
+    )
+
+    candidates["SpeedLimit"] = (
+        pd.to_numeric(
+            candidates["SpeedLimit"],
+            errors="coerce",
+        )
+    )
+
+    candidates["Heading"] = (
+        pd.to_numeric(
+            candidates["Heading"],
+            errors="coerce",
+        )
+    )
+
+    candidates[
+        "_geometry_projected"
+    ] = candidates[
+        "Geometry"
+    ].apply(
+        project_wkt_geometry
+    )
+
+    return candidates
 
 
-def assign_txdot_speed(corridor):
-    candidates = collect_txdot_candidates(corridor["Matched_GID"])
-    output = []
+# Match each OSM short link to the correct TxDOT speed-limit segment
+def assign_posted_speed_limits(
+    corridor_metadata,
+    txdot_candidates,
+):
 
-    if candidates.empty:
-        candidates = pd.DataFrame(columns=["GID_norm", "SpeedLimit", "geometry_obj", "Heading", "LinkID"])
+    result = corridor_metadata.copy()
 
-    txdot = candidates[candidates.get("geometry_obj", pd.Series(dtype=object)).notna()].copy()
-    if not txdot.empty:
-        txdot_gdf = gpd.GeoDataFrame(txdot, geometry="geometry_obj", crs="EPSG:4326").to_crs("EPSG:3083")
-    else:
-        txdot_gdf = gpd.GeoDataFrame(txdot, geometry=[], crs="EPSG:3083")
+    result[
+        "_geometry_projected"
+    ] = result[
+        "geometry"
+    ].apply(
+        project_wkt_geometry
+    )
 
-    osm_valid = corridor[corridor["geometry_obj"].notna()].copy()
-    osm_gdf = gpd.GeoDataFrame(osm_valid, geometry="geometry_obj", crs="EPSG:4326").to_crs("EPSG:3083")
-    osm_geometry = dict(zip(osm_gdf["link_key"], osm_gdf.geometry))
+    result[
+        "posted_speed_limit_mph"
+    ] = np.nan
 
-    for row in corridor.itertuples(index=False):
-        gid = normalize_gid(row.Matched_GID)
-        subset = txdot_gdf[txdot_gdf.get("GID_norm", pd.Series(index=txdot_gdf.index, dtype=object)) == gid].copy()
-        candidate_count = len(subset)
-        valid_speed = subset[subset.get("SpeedLimit", pd.Series(index=subset.index, dtype=float)).gt(0)].copy()
-        valid_speed_count = len(valid_speed)
-        geometry = osm_geometry.get(row.link_key)
+    result[
+        "txdot_link_id"
+    ] = pd.NA
 
-        if geometry is None or valid_speed.empty:
-            output.append(
-                {
-                    "link_key": row.link_key,
-                    "posted_speed_limit_mph": np.nan,
-                    "txdot_link_id": pd.NA,
-                    "txdot_gid": gid,
-                    "txdot_match_distance_ft": np.nan,
-                    "txdot_heading_difference_deg": np.nan,
-                    "txdot_candidate_count": candidate_count,
-                    "txdot_valid_speed_candidate_count": valid_speed_count,
-                    "speed_match_status": "no_valid_speed_candidate" if valid_speed.empty else "missing_osm_geometry",
-                }
-            )
+    result[
+        "txdot_match_distance_ft"
+    ] = np.nan
+
+    result[
+        "txdot_heading_difference_deg"
+    ] = np.nan
+
+    result[
+        "txdot_candidate_count"
+    ] = 0
+
+    result[
+        "txdot_valid_speed_candidate_count"
+    ] = 0
+
+    result[
+        "speed_match_status"
+    ] = "unmatched"
+
+    if txdot_candidates.empty:
+        return result
+
+    for index, row in result.iterrows():
+
+        gid = row[
+            "txdot_gid"
+        ]
+
+        osm_geometry = row[
+            "_geometry_projected"
+        ]
+
+        if pd.isna(gid):
+
+            result.at[
+                index,
+                "speed_match_status",
+            ] = "invalid_matched_gid"
+
             continue
 
-        midpoint = geometry.interpolate(0.5, normalized=True)
-        valid_speed["match_distance_ft"] = valid_speed.geometry.distance(midpoint)
-        valid_speed["heading_difference"] = valid_speed["Heading"].apply(lambda x: angular_difference(row.heading, x))
+        if (
+            osm_geometry is None
+            or osm_geometry.is_empty
+        ):
 
-        eligible = valid_speed[
-            valid_speed["match_distance_ft"].le(MAX_TXDOT_MATCH_DISTANCE_FT)
+            result.at[
+                index,
+                "speed_match_status",
+            ] = "invalid_osm_geometry"
+
+            continue
+
+        candidates = txdot_candidates[
+            txdot_candidates["GID"]
+            == int(gid)
+        ].copy()
+
+        result.at[
+            index,
+            "txdot_candidate_count",
+        ] = len(candidates)
+
+        candidates = candidates[
+            candidates[
+                "_geometry_projected"
+            ].notna()
+        ].copy()
+
+        valid_speed = candidates[
+            candidates["SpeedLimit"].notna()
+            & np.isfinite(
+                candidates["SpeedLimit"]
+            )
             & (
-                valid_speed["heading_difference"].isna()
-                | valid_speed["heading_difference"].le(MAX_TXDOT_HEADING_DIFFERENCE_DEG)
+                candidates["SpeedLimit"]
+                > 0
             )
         ].copy()
 
-        if eligible.empty:
-            best = valid_speed.sort_values("match_distance_ft").iloc[0]
-            status = "outside_threshold"
-        else:
-            best = eligible.sort_values(["match_distance_ft", "heading_difference"]).iloc[0]
-            status = "matched"
+        result.at[
+            index,
+            "txdot_valid_speed_candidate_count",
+        ] = len(valid_speed)
 
-        output.append(
-            {
-                "link_key": row.link_key,
-                "posted_speed_limit_mph": best["SpeedLimit"],
-                "txdot_link_id": best["LinkID"],
-                "txdot_gid": best["GID_norm"],
-                "txdot_match_distance_ft": best["match_distance_ft"],
-                "txdot_heading_difference_deg": best["heading_difference"],
-                "txdot_candidate_count": candidate_count,
-                "txdot_valid_speed_candidate_count": valid_speed_count,
-                "speed_match_status": status,
-            }
+        if valid_speed.empty:
+
+            result.at[
+                index,
+                "speed_match_status",
+            ] = "no_valid_speed_for_gid"
+
+            continue
+
+        midpoint = osm_geometry.interpolate(
+            0.5,
+            normalized=True,
         )
 
-    return corridor.merge(pd.DataFrame(output), on="link_key", how="left")
+        valid_speed[
+            "_distance_ft"
+        ] = valid_speed[
+            "_geometry_projected"
+        ].apply(
+            lambda geometry:
+            midpoint.distance(
+                geometry
+            )
+            * M_TO_FT
+        )
+
+        valid_speed[
+            "_heading_difference"
+        ] = valid_speed[
+            "Heading"
+        ].apply(
+            lambda value:
+            heading_difference(
+                row["heading"],
+                value,
+            )
+        )
+
+        heading_compatible = valid_speed[
+            valid_speed[
+                "_heading_difference"
+            ].isna()
+            | (
+                valid_speed[
+                    "_heading_difference"
+                ]
+                <= MAX_TXDOT_HEADING_DIFFERENCE_DEG
+            )
+        ].copy()
+
+        if heading_compatible.empty:
+
+            result.at[
+                index,
+                "speed_match_status",
+            ] = "no_heading_compatible_speed"
+
+            continue
+
+        heading_compatible = (
+            heading_compatible.sort_values(
+                by=[
+                    "_distance_ft",
+                    "_heading_difference",
+                ],
+                ascending=[
+                    True,
+                    True,
+                ],
+                na_position="last",
+            )
+        )
+
+        best = (
+            heading_compatible.iloc[0]
+        )
+
+        distance_ft = float(
+            best["_distance_ft"]
+        )
+
+        heading_diff = (
+            best[
+                "_heading_difference"
+            ]
+        )
+
+        result.at[
+            index,
+            "txdot_match_distance_ft",
+        ] = distance_ft
+
+        result.at[
+            index,
+            "txdot_heading_difference_deg",
+        ] = heading_diff
+
+        result.at[
+            index,
+            "txdot_link_id",
+        ] = best["LinkID"]
+
+        if (
+            distance_ft
+            > MAX_TXDOT_MATCH_DISTANCE_FT
+        ):
+
+            result.at[
+                index,
+                "speed_match_status",
+            ] = "txdot_segment_too_far"
+
+            continue
+
+        result.at[
+            index,
+            "posted_speed_limit_mph",
+        ] = float(
+            best["SpeedLimit"]
+        )
+
+        result.at[
+            index,
+            "speed_match_status",
+        ] = "matched"
+
+    return result
+
+
+# Calculate actual geometry endpoint gaps between consecutive links
+def add_connection_diagnostics(
+    corridor,
+):
+
+    result = corridor.sort_values(
+        "corridor_order"
+    ).reset_index(drop=True)
+
+    gaps = [
+        0.0
+    ]
+
+    topology_checks = [
+        True
+    ]
+
+    for index in range(
+        1,
+        len(result),
+    ):
+
+        previous = result.iloc[
+            index - 1
+        ]
+
+        current = result.iloc[
+            index
+        ]
+
+        topology_connected = (
+            previous["to_node_id"]
+            == current["from_node_id"]
+        )
+
+        topology_checks.append(
+            bool(topology_connected)
+        )
+
+        previous_geometry = previous[
+            "_geometry_projected"
+        ]
+
+        current_geometry = current[
+            "_geometry_projected"
+        ]
+
+        if (
+            previous_geometry is None
+            or current_geometry is None
+            or previous_geometry.is_empty
+            or current_geometry.is_empty
+        ):
+
+            gaps.append(
+                np.nan
+            )
+
+            continue
+
+        previous_end = list(
+            previous_geometry.coords
+        )[-1]
+
+        current_start = list(
+            current_geometry.coords
+        )[0]
+
+        gap_ft = (
+            np.hypot(
+                previous_end[0]
+                - current_start[0],
+                previous_end[1]
+                - current_start[1],
+            )
+            * M_TO_FT
+        )
+
+        gaps.append(
+            gap_ft
+        )
+
+    result[
+        "topology_connected_from_previous"
+    ] = topology_checks
+
+    result[
+        "geometry_connection_gap_ft"
+    ] = gaps
+
+    return result
+
+
+# Add actual roadway length and cumulative corridor distance
+def add_spatial_extent(
+    corridor,
+):
+
+    result = corridor.copy()
+
+    result[
+        "link_length_ft"
+    ] = pd.to_numeric(
+        result["length"],
+        errors="coerce",
+    )
+
+    if result[
+        "link_length_ft"
+    ].isna().any():
+
+        missing = result[
+            result[
+                "link_length_ft"
+            ].isna()
+        ]["link_key"]
+
+        raise RuntimeError(
+            "Missing short-link length for:\n"
+            + "\n".join(
+                missing.astype(str)
+            )
+        )
+
+    result[
+        "distance_start_ft"
+    ] = (
+        result["link_length_ft"]
+        .cumsum()
+        .shift(
+            fill_value=0.0
+        )
+    )
+
+    result[
+        "distance_end_ft"
+    ] = (
+        result["distance_start_ft"]
+        + result["link_length_ft"]
+    )
+
+    return result
 
 
 def main():
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    transitions, outgoing_total = build_transition_support()
-    network = load_network()
-    corridor = build_corridor(network, transitions, outgoing_total)
-    corridor = assign_txdot_speed(corridor)
 
-    columns = [
-        "corridor_order", "link_key", "from_node_id", "to_node_id", "Matched_GID", "txdot_gid",
-        "heading", "transition_support", "selection_method", "link_length_ft", "distance_start_ft",
-        "distance_end_ft", "topology_connected_from_previous", "geometry_connection_gap_ft",
-        "posted_speed_limit_mph", "txdot_link_id", "txdot_match_distance_ft",
-        "txdot_heading_difference_deg", "txdot_candidate_count", "txdot_valid_speed_candidate_count",
-        "speed_match_status", "name", "facility_type", "RDBD_TYPE", "Functional Class", "geometry",
+    start_time = time.perf_counter()
+
+    RESULTS_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    print("BUILDING CONNECTED CORRIDOR")
+    print("=" * 75)
+
+    # Step 1: Build observed CV transition support
+    transitions = build_transition_table()
+
+    # Step 2: Load actual network topology
+    print()
+    print("LOADING NETWORK TOPOLOGY")
+    print("=" * 75)
+
+    topology = load_network_topology()
+
+    # Step 3: Build a strictly connected directional path
+    print()
+    print("BUILDING TOPOLOGY-CONNECTED PATH")
+    print("=" * 75)
+
+    corridor = build_connected_corridor(
+        transitions,
+        topology,
+    )
+
+    print(
+        f"Connected links selected: "
+        f"{len(corridor):,}"
+    )
+
+    # Release the full topology before geometry / TxDOT work
+    del topology
+
+    # Step 4: Load full metadata for only those links
+    print()
+    print("LOADING CORRIDOR ROADWAY METADATA")
+    print("=" * 75)
+
+    metadata = (
+        load_corridor_network_metadata(
+            corridor
+        )
+    )
+
+    metadata[
+        "txdot_gid"
+    ] = metadata[
+        "Matched_GID"
+    ].apply(
+        normalize_matched_gid
+    )
+
+    corridor = corridor.merge(
+        metadata,
+        on="link_key",
+        how="left",
+    )
+
+    # Step 5: Load only TxDOT rows belonging to corridor GIDs
+    print()
+    print("LOADING TXDOT SPEED CANDIDATES")
+    print("=" * 75)
+
+    txdot_candidates = (
+        load_txdot_candidates(
+            corridor
+        )
+    )
+
+    print()
+    print(
+        f"TxDOT candidate segments loaded: "
+        f"{len(txdot_candidates):,}"
+    )
+
+    # Step 6: Spatially assign the actual posted speed limit
+    print()
+    print("MATCHING POSTED SPEED LIMITS")
+    print("=" * 75)
+
+    corridor = (
+        assign_posted_speed_limits(
+            corridor,
+            txdot_candidates,
+        )
+    )
+
+    del txdot_candidates
+
+    # Step 7: Verify physical connectivity
+    corridor = (
+        add_connection_diagnostics(
+            corridor
+        )
+    )
+
+    # Step 8: Use the existing short-link length for spatial extent
+    corridor = (
+        add_spatial_extent(
+            corridor
+        )
+    )
+
+    # Step 9: Keep final diagnostics and save
+    output_columns = [
+        "corridor_order",
+        "link_key",
+        "from_node_id",
+        "to_node_id",
+        "Matched_GID",
+        "txdot_gid",
+        "heading",
+        "transition_support",
+        "selection_method",
+        "link_length_ft",
+        "distance_start_ft",
+        "distance_end_ft",
+        "topology_connected_from_previous",
+        "geometry_connection_gap_ft",
+        "posted_speed_limit_mph",
+        "txdot_link_id",
+        "txdot_match_distance_ft",
+        "txdot_heading_difference_deg",
+        "txdot_candidate_count",
+        "txdot_valid_speed_candidate_count",
+        "speed_match_status",
     ]
-    corridor[[c for c in columns if c in corridor.columns]].to_csv(OUTPUT_FILE, index=False)
-    print(f"Corridor links: {len(corridor):,}")
-    print(f"Corridor length: {corridor['link_length_ft'].sum():,.1f} ft")
-    print(f"Saved: {OUTPUT_FILE}")
+
+    corridor = corridor[
+        output_columns
+    ].copy()
+
+    corridor.to_csv(
+        CORRIDOR_FILE,
+        index=False,
+    )
+
+    runtime = (
+        time.perf_counter()
+        - start_time
+    )
+
+    topology_breaks = (
+        ~corridor[
+            "topology_connected_from_previous"
+        ]
+    ).sum()
+
+    speed_matched = (
+        corridor[
+            "speed_match_status"
+        ]
+        .eq("matched")
+        .sum()
+    )
+
+    missing_speed = (
+        corridor[
+            "posted_speed_limit_mph"
+        ]
+        .isna()
+        .sum()
+    )
+
+    print()
+    print("=" * 75)
+    print("CORRIDOR PREPARATION COMPLETE")
+    print(
+        f"Links:                 "
+        f"{len(corridor):,}"
+    )
+    print(
+        f"Corridor length:       "
+        f"{corridor['link_length_ft'].sum():,.1f} ft"
+    )
+    print(
+        f"Topology breaks:       "
+        f"{topology_breaks:,}"
+    )
+    print(
+        f"Maximum geometry gap:  "
+        f"{corridor['geometry_connection_gap_ft'].max():,.2f} ft"
+    )
+    print(
+        f"Posted speeds matched: "
+        f"{speed_matched:,}/{len(corridor):,}"
+    )
+    print(
+        f"Missing posted speeds: "
+        f"{missing_speed:,}"
+    )
+    print(
+        f"Runtime:               "
+        f"{runtime / 60:.2f} min"
+    )
+    print(
+        f"Output:                "
+        f"{CORRIDOR_FILE}"
+    )
+
+    print()
+    print("SPEED MATCH STATUS")
+    print(
+        corridor[
+            "speed_match_status"
+        ]
+        .value_counts(
+            dropna=False
+        )
+        .to_string()
+    )
+
+    print()
+    print("FINAL CORRIDOR")
+    print(
+        corridor[
+            [
+                "corridor_order",
+                "link_key",
+                "link_length_ft",
+                "posted_speed_limit_mph",
+                "txdot_match_distance_ft",
+                "txdot_heading_difference_deg",
+                "selection_method",
+                "geometry_connection_gap_ft",
+                "speed_match_status",
+            ]
+        ]
+        .to_string(
+            index=False
+        )
+    )
 
 
 if __name__ == "__main__":
