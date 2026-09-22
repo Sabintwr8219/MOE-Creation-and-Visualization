@@ -1,6 +1,7 @@
-pandas
-numpy
-matplotlib
-geopandas
-shapely
-pyproj
+pandas>=2.2
+numpy>=2.0
+shapely>=2.1
+pyproj>=3.7
+pyarrow>=20
+psutil>=7.0
+matplotlib>=3.9
