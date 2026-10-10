@@ -1,9 +1,34 @@
-.venv/
-__pycache__/
-*.pyc
-Results/
-*.log
-Output/
-New Version/
-Old MOE Codes/
+# Large/restricted input data and produced results. Commit CODE, not CV records.
+/Results/
+/Input/
+/Output/
+*.parquet
+*.parquet.partial
+*.csv
+*.geojson
+*.gpkg
+*.sqlite
+*.db
 *.zip
+*.building/
+*.partial
+
+# Python/IDE/OS
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Log and secrets
+*.log
+.env
+.env.*
+*.pem
+*.key

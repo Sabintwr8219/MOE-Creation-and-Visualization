@@ -1,7 +1,8 @@
-pandas>=2.2
-numpy>=2.0
-shapely>=2.1
-pyproj>=3.7
-pyarrow>=20
-psutil>=7.0
-matplotlib>=3.9
+# Existing offset processing / streaming export dependencies
+numpy
+pandas
+pyarrow
+psutil
+# Only for the optional QGIS/GPS corridor diagnostic:
+shapely>=2
+pyproj

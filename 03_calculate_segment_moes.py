@@ -6,7 +6,6 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
-import shapely
 
 import paths
 from parallel_utils import (
@@ -23,12 +22,13 @@ SEGMENT_COUNTS = None
 
 OUTPUT_COLUMNS = [
     "moe_segment_id", "link_key", "segment_index", "time_bin",
+    "parent_from_node_id", "parent_to_node_id", "moe_from_node_id", "moe_to_node_id",
     "parent_start_ft", "parent_end_ft", "segment_length_ft",
     "parent_length_ft", "is_parent_start", "is_parent_end",
     "posted_speed_limit_mph", "speed_match_status", "avg_speed_mph",
     "speed_reduction_pct", "waypoint_count", "journey_count",
     "slow_movement_count", "slow_movement_pct", "dsh_trip_count", "DSH",
-    "complete_traversal_count", "avg_travel_time_s",
+    "complete_traversal_count", "avg_travel_time_s", "speed_estimated_travel_time_s",
 ]
 
 OUTPUT_SCHEMA = pa.schema([
@@ -36,6 +36,10 @@ OUTPUT_SCHEMA = pa.schema([
     ("link_key", pa.string()),
     ("segment_index", pa.int64()),
     ("time_bin", pa.timestamp("ns")),
+    ("parent_from_node_id", pa.string()),
+    ("parent_to_node_id", pa.string()),
+    ("moe_from_node_id", pa.string()),
+    ("moe_to_node_id", pa.string()),
     ("parent_start_ft", pa.float64()),
     ("parent_end_ft", pa.float64()),
     ("segment_length_ft", pa.float64()),
@@ -54,20 +58,18 @@ OUTPUT_SCHEMA = pa.schema([
     ("DSH", pa.float64()),
     ("complete_traversal_count", pa.float64()),
     ("avg_travel_time_s", pa.float64()),
+    ("speed_estimated_travel_time_s", pa.float64()),
 ])
 
 
-# Load parent geometry once inside each worker process.
+# Load only link lengths; offset assignment never loads road or vehicle geometry.
 def initialize_worker():
     global PARENTS, PARENT_INDEX, SEGMENT_COUNTS
     parents = pd.read_parquet(
         paths.PARENT_FILE,
-        columns=["link_key", "parent_length_ft", "geometry_wkb"],
+        columns=["link_key", "parent_length_ft"],
     )
     parents["link_key"] = parents["link_key"].astype(str)
-    parents["geometry"] = shapely.from_wkb(
-        parents.pop("geometry_wkb").to_numpy()
-    )
     parents = parents.reset_index(drop=True)
     PARENTS = parents
     PARENT_INDEX = pd.Series(
@@ -83,7 +85,7 @@ def initialize_worker():
     SEGMENT_COUNTS = dict(zip(parents["link_key"], counts))
 
 
-# Locate every CV observation along its parent and assign a 200-ft segment.
+# Locate each matched waypoint using only its longitudinal and lateral offsets.
 def assign_segments(data, parents=None, parent_index=None):
     parents = PARENTS if parents is None else parents
     parent_index = PARENT_INDEX if parent_index is None else parent_index
@@ -96,19 +98,17 @@ def assign_segments(data, parents=None, parent_index=None):
     if data.empty:
         return data
 
-    x = pd.to_numeric(data["x_ft"], errors="coerce").to_numpy(float)
-    y = pd.to_numeric(data["y_ft"], errors="coerce").to_numpy(float)
-    valid = np.isfinite(x) & np.isfinite(y)
+    position_ft = pd.to_numeric(data["x_ft"], errors="coerce").to_numpy(float)
+    lateral_ft = pd.to_numeric(data["y_ft"], errors="coerce").to_numpy(float)
+    lengths = parents["parent_length_ft"].to_numpy(float)[indices]
+    valid = (np.isfinite(position_ft) & np.isfinite(lateral_ft)
+             & (position_ft >= -1.0) & (position_ft <= lengths + 1.0)
+             & (np.abs(lateral_ft) <= 100.01))
     data = data.loc[valid].copy()
     indices = indices[valid]
-    x = x[valid]
-    y = y[valid]
+    position_ft = position_ft[valid]
     if data.empty:
         return data
-
-    points = shapely.points(x / paths.M_TO_FT, y / paths.M_TO_FT)
-    lines = parents["geometry"].to_numpy()[indices]
-    position_ft = shapely.line_locate_point(lines, points) * paths.M_TO_FT
     length_ft = parents["parent_length_ft"].to_numpy(float)[indices]
     position_ft = np.clip(position_ft, 0.0, np.nextafter(length_ft, -np.inf))
     segment_index = np.floor(position_ft / paths.SEGMENT_LENGTH_FT).astype(int) + 1
@@ -138,7 +138,11 @@ def prepare_sequence(data):
     long_gap = gap.gt(
         paths.MAX_WAYPOINT_GAP_SECONDS
     ).fillna(False).to_numpy(dtype=bool)
-    new_trip = new_journey | long_gap
+    missing_source = (
+        data["_source_order"].diff().ne(1).fillna(True).to_numpy(dtype=bool)
+        if "_source_order" in data else np.zeros(len(data), dtype=bool)
+    )
+    new_trip = new_journey | long_gap | missing_source
     trip_number = np.cumsum(new_trip)
     data["trip_id"] = (
         data["journey_id"].astype(str) + "::" + trip_number.astype(str)
@@ -159,6 +163,12 @@ def prepare_sequence(data):
 
 # Calculate speed and DSH components for complete journey partitions.
 def calculate_speed_components(data):
+    data = data.copy()
+    data["speed_mph"] = pd.to_numeric(data["speed_mph"], errors="coerce")
+    data.loc[data["speed_mph"] < 0, "speed_mph"] = np.nan
+    data["speed_change"] = data.groupby(
+        ["segment_run_id", "time_bin"], sort=False
+    )["speed_mph"].diff().abs()
     valid = data[
         data["speed_mph"].notna()
         & np.isfinite(data["speed_mph"])
@@ -177,17 +187,15 @@ def calculate_speed_components(data):
         slow_speed_sum=("slow_speed", "sum"),
     )
 
-    valid["speed_change"] = valid.groupby(
-        ["segment_run_id", "time_bin"], sort=False
-    )["speed_mph"].diff().abs()
     run_dsh = valid.groupby(
         ["trip_id", "moe_segment_id", "segment_run_id", "time_bin"],
         as_index=False,
     ).agg(
         waypoint_count=("speed_mph", "size"),
         speed_change_sum=("speed_change", "sum"),
+        speed_change_count=("speed_change", "count"),
     )
-    run_dsh = run_dsh[run_dsh["waypoint_count"] >= 2].copy()
+    run_dsh = run_dsh[run_dsh["speed_change_count"] >= 1].copy()
     if run_dsh.empty:
         return basic, None
     run_dsh["trip_dsh"] = run_dsh["speed_change_sum"] / run_dsh["waypoint_count"]
@@ -282,6 +290,8 @@ def process_partition(partition_file, partial_directory):
     partial_directory = Path(partial_directory)
     number = int(partition_file.stem.rsplit("_", 1)[-1])
     data = pd.read_parquet(partition_file)
+    data = data.sort_values(["journey_id", "capture_time"]).reset_index(drop=True)
+    data["_source_order"] = np.arange(len(data))
     assigned = assign_segments(data)
     sequence = prepare_sequence(assigned)
     basic, dsh = calculate_speed_components(sequence)
@@ -357,6 +367,8 @@ def reduce_partials(partial_directory):
     for column in ["dsh_trip_count", "DSH", "complete_traversal_count", "avg_travel_time_s"]:
         if column not in basic:
             basic[column] = np.nan
+    basic["DSH"] = basic["DSH"].fillna(0.0)
+    basic["dsh_trip_count"] = basic["dsh_trip_count"].fillna(0.0)
     return basic
 
 
@@ -371,7 +383,7 @@ def write_final_output(observed, segments):
         if column not in {"moe_segment_id", "time_bin"}
     ]
     observed = observed.set_index(["moe_segment_id", "time_bin"]).sort_index()
-    metadata = segments.drop(columns="geometry_wkb")
+    metadata = segments
     temporary = paths.MOE_FILE.with_name(paths.MOE_FILE.stem + ".partial.parquet")
     if temporary.exists():
         temporary.unlink()
@@ -398,12 +410,19 @@ def write_final_output(observed, segments):
                 / result["posted_speed_limit_mph"] * 100,
                 np.nan,
             )
+            speed = result["avg_speed_mph"].to_numpy(float)
+            estimated = np.full(len(result), np.nan, dtype=float)
+            np.divide(
+                result["segment_length_ft"].to_numpy(float) * 3600.0 / 5280.0,
+                speed, out=estimated, where=np.isfinite(speed) & (speed > 0),
+            )
+            result["speed_estimated_travel_time_s"] = estimated
             for column in OUTPUT_COLUMNS:
                 if column not in result:
                     result[column] = np.nan
             numeric = [
                 "avg_speed_mph", "speed_reduction_pct", "slow_movement_pct",
-                "DSH", "avg_travel_time_s",
+                "DSH", "avg_travel_time_s", "speed_estimated_travel_time_s",
             ]
             result[numeric] = result[numeric].round(3)
             table = pa.Table.from_pandas(
@@ -453,9 +472,16 @@ def calculate_moes(workers=None, rebuild_partitions=False, max_cv_rows=None):
 
     print("Reducing worker aggregates...")
     observed = reduce_partials(paths.MOE_PARTIAL_DIR)
-    segments = pd.read_parquet(paths.SEGMENT_FILE)
+    # The saved geometry established the segment inventory; MOE math needs only its attributes.
+    segment_columns = [
+        "moe_segment_id", "link_key", "segment_index", "parent_from_node_id",
+        "parent_to_node_id", "moe_from_node_id", "moe_to_node_id", "parent_start_ft",
+        "parent_end_ft", "segment_length_ft", "parent_length_ft", "is_parent_start",
+        "is_parent_end", "posted_speed_limit_mph", "speed_match_status",
+    ]
+    segments = pd.read_parquet(paths.SEGMENT_FILE, columns=segment_columns)
     segment_time_rows, time_bin_count = write_final_output(observed, segments)
-    print("\nFIVE-MINUTE MOE CALCULATION COMPLETE")
+    print(f"\n{paths.TIME_BIN_MINUTES}-MINUTE OFFSET MOE CALCULATION COMPLETE")
     print(f"Workers: {workers}")
     print(f"CV rows partitioned: {partition_rows:,}")
     print(f"Observations assigned: {assigned_rows:,}")
